@@ -1,0 +1,862 @@
+import streamlit as st
+import pandas as pd
+import zipfile
+from pyvis.network import Network
+import plotly.graph_objects as go
+import matplotlib.colors as mcolors
+import matplotlib.cm as cm
+from datetime import datetime
+import os
+import tempfile
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+st.set_page_config(page_title="Transactional Network Analysis", page_icon="🕸️", layout="wide")
+st.title("🕸️ Transactional Network Analysis")
+
+# ------------------- UI & Sidebar -------------------
+@st.cache_data(show_spinner=False)
+def get_available_partitions():
+    # Adjust this path to your file location
+    local_path = r"C:\Users\adrian.muhammad\Desktop\SNA\list_partitions\available_partitions.csv"
+    # Check if the file exists
+    if not os.path.exists(local_path):
+        st.warning(f"File partition list not found at {local_path}")
+        return []
+    try:
+        # Read CSV into Pandas DataFrame
+        df_pandas = pd.read_csv(local_path)
+        # Clean and get unique year_month
+        return sorted(df_pandas["year_month"].dropna().astype(int).unique().tolist())
+    except Exception as e:
+        st.error(f"Failed to read CSV file: {e}")
+        return []
+
+# Dynamic dropdown from Hive partitions
+available_ym = get_available_partitions()
+
+# Get the latest year_month from available partitions
+if available_ym:
+    latest_ym = max(available_ym)
+    default_year = int(str(latest_ym)[:4])
+    default_month = int(str(latest_ym)[4:6])
+
+    # Set default value to session state if not already present
+    if "year" not in st.session_state:
+        st.session_state["year"] = default_year
+    if "month" not in st.session_state:
+        st.session_state["month"] = default_month
+
+year_options = sorted(set(int(str(ym)[:4]) for ym in available_ym), reverse=True)
+
+with st.sidebar.form("form_filter"):
+    selected_year = st.selectbox("Select Year", year_options, key="year")
+    month_options = sorted(set(int(str(ym)[4:]) for ym in available_ym if str(ym).startswith(str(selected_year))))
+    selected_month = st.selectbox("Select Month", month_options, key="month")
+    load_data = st.form_submit_button("🔄 Load Data")
+
+selected_ym = int(f"{selected_year}{selected_month:02}")
+
+# ------------------- Load Data -------------------
+@st.cache_data(show_spinner=False)
+def load_data_from_month(ym: int):
+    # Adjust this path to your file location
+    local_zip_file = rf"C:\Users\adrian.muhammad\Desktop\SNA\data_cache\month={ym}.zip"
+
+    if not os.path.exists(local_zip_file):
+        st.error(f"❌ Zip file not found: {local_zip_file}")
+        return None
+
+    try:
+        # Open ZIP and directly read the first CSV file within it
+        with zipfile.ZipFile(local_zip_file, 'r') as zip_ref:
+            csv_list = [f for f in zip_ref.namelist() if f.endswith(".csv")]
+            if not csv_list:
+                st.error("❌ No CSV file found within the ZIP.")
+                return None
+
+            # Read directly from the ZIP file (without extraction)
+            with zip_ref.open(csv_list[0]) as csv_file:
+                df = pd.read_csv(csv_file)
+                df['dt_id'] = pd.to_datetime(df['dt_id'], errors='coerce')
+                df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
+                # Clean account no to remove ".0"
+                df['source_account_no'] = (
+                    df['source_account_no']
+                    .fillna('')
+                    .astype(str)
+                    .str.strip()
+                    .str.replace(r'\.0$', '', regex=True)
+                    .str.replace(r'^nan$', '', regex=True)
+                )
+
+                df['dest_account_no'] = (
+                    df['dest_account_no']
+                    .fillna('')
+                    .astype(str)
+                    .str.strip()
+                    .str.replace(r'\.0$', '', regex=True)
+                    .str.replace(r'^nan$', '', regex=True)
+                )
+
+                return df
+
+    except Exception as e:
+        st.error(f"❌ Failed to load data from ZIP: {e}")
+        return None
+
+# If no data in session_state and partitions are available, auto-load latest data
+if "data" not in st.session_state and available_ym:
+    selected_ym = int(f"{st.session_state['year']}{st.session_state['month']:02}")
+    with st.spinner(f"🔄 Auto-loading latest data for {selected_ym}..."):
+        df = load_data_from_month(selected_ym)
+        if df is not None:
+            st.session_state["data"] = df
+
+if "data" not in st.session_state:
+    st.session_state["data"] = None
+
+if load_data:
+    with st.spinner(f"Loading data for {selected_ym}..."):
+        df = load_data_from_month(selected_ym)
+        if df is None:
+            st.warning("❌ No data available.")
+            st.stop()
+        st.session_state["data"] = df
+
+data = st.session_state["data"]
+if data is None:
+    st.info("📂 Please load data first using the sidebar.")
+    st.stop()
+
+# ------------------- Date Filter -------------------
+min_d = data['dt_id'].dropna().min().date()
+max_d = data['dt_id'].dropna().max().date()
+# Ensure min_d is less than or equal to max_d, and set max_d to today if it's in the future
+today = datetime.now().date()
+if max_d > today:
+    max_d = today
+if min_d > max_d:
+    min_d = max_d
+
+
+node_type = st.sidebar.radio("Choose Perspective", ["by Ecosystem", "by CIF"])
+start_date = st.sidebar.date_input("Start Date", min_d)
+end_date = st.sidebar.date_input("End Date", max_d)
+
+if start_date > end_date:
+    st.error("End date must be after start date.")
+    st.stop()
+
+filtered_data = data[(data['dt_id'].dt.date >= start_date) & (data['dt_id'].dt.date <= end_date)]
+
+# ------------------- Network Visualization -------------------
+@st.cache_data(show_spinner=False)
+def create_network_visualization(filtered_data, node_type, src_col_net, dst_col_net, full_data=None, 
+                                 selected_entity_filter=None, selected_dinas_filter=None, selected_sub_dinas_filter=None):
+    net = Network(height="550px", width="100%", bgcolor="white", font_color="black", directed=True)
+    
+    # Initialize color map based on Entity Name (always)
+    node_color_map_by_entity = {}
+    # Include 'Other Banks' here to allow it to be colored and appear in the legend
+    all_entities = pd.unique(full_data[['source_entity_name', 'dest_entity_name']].values.ravel('K'))
+    all_entities = [e for e in all_entities if pd.notnull(e)] 
+    
+    # Ensure a consistent colormap even if some entities are filtered out later
+    cmap = cm.get_cmap('tab20', max(1, len(all_entities))) 
+    for i, entity in enumerate(all_entities):
+        node_color_map_by_entity[entity] = mcolors.to_hex(cmap(i))
+            
+    edge_data = (
+        filtered_data
+        .groupby([src_col_net, dst_col_net])
+        .agg(
+            total_amount=('amount', 'sum'),
+            frequency=('amount', 'count'),
+            transaction_types=('jenis_transaksi', lambda x: ', '.join(sorted(set(x.dropna())))),
+            group_channels=('group_channel', lambda x: ', '.join(sorted(set(x.dropna()))))
+        )
+        .reset_index()
+    )
+
+    added_nodes = set()
+    node_info_cache = {}
+
+    def clean_node(val):
+        return str(int(val)) if pd.notnull(val) and isinstance(val, float) else str(val)
+
+    def build_cif_node_info(cif: str):
+        if cif in node_info_cache:
+            return node_info_cache[cif]
+
+        lookup_data = full_data if full_data is not None else filtered_data
+        rel = lookup_data[(lookup_data['source_cif'] == cif) | (lookup_data['dest_cif'] == cif)]
+
+        # Get information from source first, if empty then from destination
+        def get_column_value(src_col, dest_col):
+            val_src = rel[rel['source_cif'] == cif][src_col].dropna().unique()
+            
+            val = [] # Initialize val as an empty list
+            if len(val_src) == 0:
+                val = rel[rel['dest_cif'] == cif][dest_col].dropna().unique()
+            else:
+                val = val_src # If val_src has content, use it for val
+                
+            return val[0] if len(val) > 0 else "-"
+
+        name = get_column_value("source_customer_name", "dest_customer_name")
+        cif_type = get_column_value("source_cif_type_name", "dest_cif_type_name")
+        entity = get_column_value("source_entity_name", "dest_entity_name")
+        dinas = get_column_value("source_kode_dinas_desc", "dest_kode_dinas_desc")
+        sub_dinas = get_column_value("source_kode_sub_dinas_desc", "dest_kode_sub_dinas_desc")
+        sub_sub_dinas = get_column_value("source_kode_sub_sub_dinas_desc", "dest_kode_sub_sub_dinas_desc")
+
+        acc_no_src = rel[rel['source_cif'] == cif]['source_account_no'].dropna().astype(str).unique().tolist()
+        acc_no_dest = rel[rel['dest_cif'] == cif]['dest_account_no'].dropna().astype(str).unique().tolist()
+        account_numbers = [
+            acc for acc in set(acc_no_src + acc_no_dest)
+            if acc and acc != "0"
+        ]
+
+        title = (
+            f"CIF: {cif} ({cif_type})\n"
+            f"Name: {name}\n"
+            f"Account No: {', '.join(account_numbers) if account_numbers else '-'}\n"
+            f"Ecosystem: {entity}\n"
+            f"Dinas: {dinas}\n"
+            f"Sub Dinas: {sub_dinas}\n"
+            f"Sub Sub Dinas: {sub_sub_dinas}"
+        )
+        
+        node_info_cache[cif] = title
+        return title
+
+    # New function to build node info for Ecosystem perspective (adjusted)
+    def build_ecosystem_node_info(node_value: str, node_level_col: str, full_data: pd.DataFrame,
+                                  selected_entity_filter: str, selected_dinas_filter: str, selected_sub_dinas_filter: str):
+        
+        # Define a helper to get unique values from both source/dest columns
+        def get_unique_values_for_tooltip(df_rel, src_col, dest_col):
+            values = pd.concat([
+                df_rel[src_col].dropna(),
+                df_rel[dest_col].dropna()
+            ]).astype(str).unique().tolist()
+            return ", ".join(sorted(filter(None, values))) if values else "-"
+
+        # Start with full_data (for month) and apply current date filters
+        # Further refine this data by the *global* entity/dinas/sub_dinas filters *if they are not the level of the node itself*
+        rel_data_context = full_data.copy()
+
+        # Apply global entity filter if the node level is Dinas or Sub Dinas
+        if node_level_col != 'source_entity_name' and selected_entity_filter and selected_entity_filter != "Unknown":
+            rel_data_context = rel_data_context[
+                (rel_data_context['source_entity_name'] == selected_entity_filter) |
+                (rel_data_context['dest_entity_name'] == selected_entity_filter)
+            ]
+        
+        # Apply global dinas filter if the node level is Sub Dinas
+        if node_level_col != 'source_kode_dinas_desc' and selected_dinas_filter and selected_dinas_filter != "-":
+            rel_data_context = rel_data_context[
+                (rel_data_context['source_kode_dinas_desc'] == selected_dinas_filter) |
+                (rel_data_context['dest_kode_dinas_desc'] == selected_dinas_filter)
+            ]
+
+        # Filter 'rel_data_context' specifically for the current 'node_value'
+        if node_level_col == 'source_entity_name':
+            rel_data = rel_data_context[(rel_data_context['source_entity_name'] == node_value) | (rel_data_context['dest_entity_name'] == node_value)]
+            ecosystem_info = node_value # The node itself is the Ecosystem
+            dinas_info = get_unique_values_for_tooltip(rel_data, 'source_kode_dinas_desc', 'dest_kode_dinas_desc')
+            sub_dinas_info = get_unique_values_for_tooltip(rel_data, 'source_kode_sub_dinas_desc', 'dest_kode_sub_dinas_desc')
+            sub_sub_dinas_info = get_unique_values_for_tooltip(rel_data, 'source_kode_sub_sub_dinas_desc', 'dest_kode_sub_sub_dinas_desc')
+            cif_info = get_unique_values_for_tooltip(rel_data, 'source_cif', 'dest_cif')
+
+        elif node_level_col == 'source_kode_dinas_desc':
+            rel_data = rel_data_context[(rel_data_context['source_kode_dinas_desc'] == node_value) | (rel_data_context['dest_kode_dinas_desc'] == node_value)]
+            ecosystem_info = selected_entity_filter if selected_entity_filter and selected_entity_filter != "Unknown" else get_unique_values_for_tooltip(rel_data, 'source_entity_name', 'dest_entity_name')
+            dinas_info = node_value # The node itself is the Dinas
+            sub_dinas_info = get_unique_values_for_tooltip(rel_data, 'source_kode_sub_dinas_desc', 'dest_kode_sub_dinas_desc')
+            sub_sub_dinas_info = get_unique_values_for_tooltip(rel_data, 'source_kode_sub_sub_dinas_desc', 'dest_kode_sub_sub_dinas_desc')
+            cif_info = get_unique_values_for_tooltip(rel_data, 'source_cif', 'dest_cif')
+
+        elif node_level_col == 'source_kode_sub_dinas_desc':
+            rel_data = rel_data_context[(rel_data_context['source_kode_sub_dinas_desc'] == node_value) | (rel_data_context['dest_kode_sub_dinas_desc'] == node_value)]
+            ecosystem_info = selected_entity_filter if selected_entity_filter and selected_entity_filter != "Unknown" else get_unique_values_for_tooltip(rel_data, 'source_entity_name', 'dest_entity_name')
+            dinas_info = selected_dinas_filter if selected_dinas_filter and selected_dinas_filter != "-" else get_unique_values_for_tooltip(rel_data, 'source_kode_dinas_desc', 'dest_kode_dinas_desc')
+            sub_dinas_info = node_value # The node itself is the Sub Dinas
+            sub_sub_dinas_info = get_unique_values_for_tooltip(rel_data, 'source_kode_sub_sub_dinas_desc', 'dest_kode_sub_sub_dinas_desc')
+            cif_info = get_unique_values_for_tooltip(rel_data, 'source_cif', 'dest_cif')
+        else:
+            return f"Node: {node_value}" # Fallback for unexpected node_level_col
+
+        title = (
+            f"Ecosystem: {ecosystem_info}\n"
+            f"Dinas: {dinas_info}\n"
+            f"Sub Dinas: {sub_dinas_info}\n"
+            f"Sub Sub Dinas: {sub_sub_dinas_info}\n"
+            f"CIFs: {cif_info}"
+        )
+        return title
+
+    # Function to get entity name for a given node (CIF, Entity Name, or Dinas)
+    def get_entity_for_node(node_value, node_type, full_data, src_col_net):
+        if node_type == 'by CIF':
+            # For CIF, find its associated entity name
+            entity = full_data[
+                (full_data['source_cif'] == node_value)
+            ]['source_entity_name'].dropna().unique()
+            if len(entity) == 0:
+                entity = full_data[
+                    (full_data['dest_cif'] == node_value)
+                ]['dest_entity_name'].dropna().unique()
+            return entity[0] if len(entity) > 0 else "Unknown"
+        elif src_col_net == 'source_entity_name':
+            # If the network is built on entity names, the node_value IS the entity name
+            return node_value
+        elif src_col_net == 'source_kode_dinas_desc':
+            # If the network is built on dinas, find the associated entity name for that dinas
+            entity = full_data[
+                (full_data['source_kode_dinas_desc'] == node_value)
+            ]['source_entity_name'].dropna().unique()
+            if len(entity) == 0:
+                entity = full_data[
+                    (full_data['dest_kode_dinas_desc'] == node_value)
+                ]['dest_entity_name'].dropna().unique()
+            return entity[0] if len(entity) > 0 else "Unknown"
+        elif src_col_net == 'source_kode_sub_dinas_desc': # Added for Sub Dinas
+            entity = full_data[
+                (full_data['source_kode_sub_dinas_desc'] == node_value)
+            ]['source_entity_name'].dropna().unique()
+            if len(entity) == 0:
+                entity = full_data[
+                    (full_data['dest_kode_sub_dinas_desc'] == node_value)
+                ]['dest_entity_name'].dropna().unique()
+            return entity[0] if len(entity) > 0 else "Unknown"
+        return "Unknown" # Fallback
+
+    for _, row in edge_data.iterrows():
+        src_node = clean_node(row[src_col_net])
+        dst_node = clean_node(row[dst_col_net])
+
+        # Determine color for source node
+        src_entity = get_entity_for_node(src_node, node_type, full_data, src_col_net)
+        src_color = node_color_map_by_entity.get(src_entity, "#cccccc") # Default grey if entity not found or 'Other Banks'
+
+        if src_node not in added_nodes:
+            # Modified this line to pass filter values to build_ecosystem_node_info
+            title = build_cif_node_info(src_node) if node_type == 'by CIF' else \
+                    build_ecosystem_node_info(src_node, src_col_net, full_data, 
+                                              selected_entity_filter, selected_dinas_filter, selected_sub_dinas_filter)
+            net.add_node(src_node, label=src_node, title=title, color=src_color)
+            added_nodes.add(src_node) 
+
+        # Determine color for destination node
+        dst_entity = get_entity_for_node(dst_node, node_type, full_data, src_col_net)
+        dst_color = node_color_map_by_entity.get(dst_entity, "#cccccc")
+
+        if dst_node not in added_nodes:
+            # Modified this line to pass filter values to build_ecosystem_node_info
+            title = build_cif_node_info(dst_node) if node_type == 'by CIF' else \
+                    build_ecosystem_node_info(dst_node, src_col_net, full_data, 
+                                              selected_entity_filter, selected_dinas_filter, selected_sub_dinas_filter)
+            net.add_node(dst_node, label=dst_node, title=title, color=dst_color)
+            added_nodes.add(dst_node) 
+
+        edge_title = (
+                f"Frequency: {row['frequency']}\n"
+                f"Total Amount: Rp.{row['total_amount']:,.2f}\n"
+                f"Transaction: {row['transaction_types']}\n"
+                f"Channel: {row['group_channels']}"
+            )
+        net.add_edge(src_node, dst_node, value=row['frequency'], title=edge_title, width=row['frequency'])
+
+    return net, edge_data, node_color_map_by_entity # Return the entity-based color map
+
+# ------------------- Sankey Visualization -------------------
+@st.cache_data(show_spinner=False)
+def create_sankey_visualization(sankey_data, src_col, dst_col): # Receives src_col and dst_col
+    # Ensure amount column is valid
+    sankey_data['amount'] = pd.to_numeric(sankey_data['amount'], errors='coerce')
+    sankey_data = sankey_data.dropna(subset=['amount'])
+
+    # Remove self-loops (source & destination are the same)
+    sankey_data = sankey_data[sankey_data[src_col] != sankey_data[dst_col]]
+
+    # Group and get top-N edges by amount (optional: limit for speed)
+    sankey_data = sankey_data.groupby([src_col, dst_col], as_index=False)['amount'].sum()
+    sankey_data = sankey_data.sort_values('amount', ascending=False).head(500)   # 💡 Limit if needed
+
+    # Build unique node index
+    all_nodes = pd.unique(sankey_data[[src_col, dst_col]].values.ravel('K')).tolist()
+    node_idx = {node: i for i, node in enumerate(all_nodes)}
+
+    # Mapping source, target, and value
+    sankey_source = sankey_data[src_col].map(node_idx).tolist()
+    sankey_target = sankey_data[dst_col].map(node_idx).tolist()
+    sankey_value = sankey_data['amount'].tolist()
+
+    # Custom node colors
+    custom_colors = [
+        "#FF6F61", "#6B5B95", "#88B04B", "#F7CAC9", "#92A8D1",
+        "#955251", "#B565A7", "#009B77", "#DD4124", "#45B8AC"
+    ]
+    node_colors = [custom_colors[i % len(custom_colors)] for i, _ in enumerate(all_nodes)] # Changed to use all_nodes length
+
+    # Function to blend link colors based on origin & destination
+    def blend_color(c1, c2):
+        r1, g1, b1 = mcolors.to_rgb(c1)
+        r2, g2, b2 = mcolors.to_rgb(c2)
+        return mcolors.to_hex(((r1 + r2) / 2, (g1 + g2) / 2, (b1 + b2) / 2))
+
+    link_colors = [blend_color(node_colors[s], node_colors[t]) for s, t in zip(sankey_source, sankey_target)]
+
+    # Create sankey chart
+    return go.Figure(go.Sankey(
+        node=dict(label=all_nodes, color=node_colors, pad=20, thickness=30, line=dict(color="gray", width=0.5)),
+        link=dict(source=sankey_source, target=sankey_target, value=sankey_value, color=link_colors)
+    )).update_layout(height=600, font_size=12)
+
+
+# ------------------- Filter by Node Logic -------------------
+# Initialize variables for columns to be used outside the if/else block
+selected_node_value = None
+filter_mask = pd.Series([True] * len(filtered_data), index=filtered_data.index) # Default mask without filter
+
+# Initialize empty or default DataFrame if no filter applies
+filtered_network_data = pd.DataFrame(columns=filtered_data.columns)
+input_data = pd.DataFrame(columns=filtered_data.columns)
+output_data = pd.DataFrame(columns=filtered_data.columns)
+
+# Initialize summary variables for "by CIF" case
+name = "-"
+cif_type = "-"
+account_str = "-"
+selected_entity = "-"
+selected_kode_dinas = "-"
+selected_kode_sub_dinas = "-"
+selected_kode_sub_sub_dinas = "-"
+
+# Initialize ecosystem-specific filter variables to a safe default
+selected_entity_name = None
+selected_dinas_desc = None
+selected_sub_dinas_desc = None
+
+
+# Default columns for network and sankey (will be overwritten if Ecosystem is chosen)
+src_col_net_global = 'source_cif'
+dst_col_net_global = 'dest_cif'
+src_col_sankey_global = 'source_cif'
+dst_col_sankey_global = 'dest_cif'
+display_name = "CIF" # Default for CIF
+
+if node_type == "by CIF":
+    unique_nodes = sorted(set(filtered_data['source_cif'].dropna().astype(str)) | set(filtered_data['dest_cif'].dropna().astype(str)))
+    
+    col1, col2 = st.columns([2, 3])
+
+    with col1:
+        dropdown_cif = st.selectbox("Select a CIF", unique_nodes, key="cif_dropdown_manual")
+
+    with col2:
+        pasted_cif = st.text_input("Or paste CIF here (will override dropdown if valid)", key="cif_paste_manual")
+
+    # Final selected_cif based on priority: paste > dropdown
+    if pasted_cif.strip() and pasted_cif in unique_nodes:
+        selected_node_value = pasted_cif
+    elif pasted_cif.strip() and pasted_cif not in unique_nodes:
+        st.warning("⚠️ CIF not found in the list.")
+        selected_node_value = dropdown_cif
+    else:
+        selected_node_value = dropdown_cif
+    
+    # Get all transactions related to this CIF
+    related_data = filtered_data[(filtered_data['source_cif'] == selected_node_value) | (filtered_data['dest_cif'] == selected_node_value)]
+
+    # --- FUNCTION get_related_info (Fixed) ---
+    def get_related_info(df_rel, cif_val, src_col, dest_col):
+        val_src = df_rel[df_rel['source_cif'] == cif_val][src_col].dropna().unique()
+        
+        val = [] # Initialize val as an empty list
+        if len(val_src) == 0:
+            val = df_rel[df_rel['dest_cif'] == cif_val][dest_col].dropna().unique()
+        else:
+            val = val_src # If val_src has content, use it for val
+            
+        return val[0] if len(val) > 0 else "-"
+    # --- END OF FUNCTION get_related_info ---
+
+    selected_entity = get_related_info(related_data, selected_node_value, 'source_entity_name', 'dest_entity_name')
+    selected_kode_dinas = get_related_info(related_data, selected_node_value, 'source_kode_dinas_desc', 'dest_kode_dinas_desc')
+    selected_kode_sub_dinas = get_related_info(related_data, selected_node_value, 'source_kode_sub_dinas_desc', 'dest_kode_sub_dinas_desc')
+    selected_kode_sub_sub_dinas = get_related_info(related_data, selected_node_value, 'source_kode_sub_sub_dinas_desc', 'dest_kode_sub_sub_dinas_desc')
+
+
+    # Get CIF information
+    name_lookup = related_data[related_data['source_cif'] == selected_node_value]['source_customer_name'].dropna().unique()
+    name = name_lookup[0] if len(name_lookup) else "-"
+
+    cif_type_lookup = related_data[related_data['source_cif'] == selected_node_value]['source_cif_type_name'].dropna().unique()
+    cif_type = cif_type_lookup[0] if len(cif_type_lookup) else "-"
+
+    account_numbers = pd.concat([
+        related_data[related_data['source_cif'] == selected_node_value]['source_account_no'],
+        related_data[related_data['dest_cif'] == selected_node_value]['dest_account_no']
+    ]).dropna().unique()
+    account_str = ", ".join(map(str, account_numbers))
+
+    # Display small markdown
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        cif_value = selected_node_value
+        st.markdown(f"""
+        <div style="font-size:13px; line-height:1.6;">
+        <b>Name</b>: {name}<br>
+        <b>CIF</b>: {cif_value} ({cif_type})<br>
+        <b>Account No</b>: {account_str if account_str else "-"}
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col2:
+        st.markdown(f"""
+        <div style="font-size:13px; line-height:1.6;">
+        <b>Ecosystem</b>: {selected_entity if selected_entity else "-"}<br>
+        <b>Dinas</b>: {selected_kode_dinas if selected_kode_dinas else "-"}
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col3:
+        st.markdown(f"""
+        <div style="font-size:13px; line-height:1.6;">
+        <b>Sub Dinas</b>: {selected_kode_sub_dinas if selected_kode_sub_dinas else "-"}<br>
+        <b>Sub Sub Dinas</b>: {selected_kode_sub_sub_dinas if selected_kode_sub_sub_dinas else "-"}
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Basic filter based on CIF
+    filter_mask = (filtered_data['source_cif'] == selected_node_value) | (filtered_data['dest_cif'] == selected_node_value)
+    
+    # Input/output data should still be from filtered_data, not strictly filtered cif_filtered_data
+    input_data_base = filtered_data[filtered_data['dest_cif'] == selected_node_value]
+    output_data_base = filtered_data[filtered_data['source_cif'] == selected_node_value]
+
+    # Final data for visualization
+    filtered_network_data = filtered_data[filter_mask]
+    input_data = input_data_base
+    output_data = output_data_base
+
+else: # node_type == "by Ecosystem"
+    
+    # Dropdown 1 and 2 in one row
+    col_level, col_entity = st.columns(2)
+
+    with col_level:
+        ecosystem_level_choice = st.selectbox(
+            "Select Filter Level:", 
+            ["Ecosystem", "Dinas", "Sub Dinas"], # Added "Sub Dinas"
+            key="ecosystem_level_choice"
+        )
+
+    with col_entity:
+        # Dropdown 2: entity_name (always present), Remove "Other Banks" from selectable options
+        all_entity_names_for_dropdown = sorted(set(filtered_data['source_entity_name'].dropna().astype(str)) | 
+                                               set(filtered_data['dest_entity_name'].dropna().astype(str)))
+        
+        unique_entity_names_for_dropdown = [e for e in all_entity_names_for_dropdown if e != 'Other Banks']
+        
+        if not unique_entity_names_for_dropdown:
+            st.info("No Entity Names available for this date (after removing 'Other Banks').")
+            filtered_network_data = pd.DataFrame(columns=filtered_data.columns)
+            input_data = pd.DataFrame(columns=filtered_data.columns)
+            output_data = pd.DataFrame(columns=filtered_data.columns)
+            st.stop() 
+
+        selected_entity_name = st.selectbox(
+            "Select Ecosystem Name:", unique_entity_names_for_dropdown, key="select_entity_name"
+        )
+
+    # Dropdown 3: Dinas appears conditionally
+    selected_dinas_desc = "-" # Default
+    if ecosystem_level_choice == "Dinas" or ecosystem_level_choice == "Sub Dinas": # Condition updated
+        # Get dinas from source_kode_dinas_desc if source_entity_name matches
+        dinas_from_source = filtered_data[
+            filtered_data['source_entity_name'] == selected_entity_name
+        ]['source_kode_dinas_desc'].dropna().astype(str).tolist()
+
+        # Get dinas from dest_kode_dinas_desc if dest_entity_name matches
+        dinas_from_dest = filtered_data[
+            filtered_data['dest_entity_name'] == selected_entity_name
+        ]['dest_kode_dinas_desc'].dropna().astype(str).tolist()
+
+        # Combine and get unique values
+        unique_dinas_desc = sorted(list(set(dinas_from_source + dinas_from_dest)))
+        
+        if not unique_dinas_desc:
+            st.info(f"No Dinas available for '{selected_entity_name}'.")
+            st.selectbox("Select Dinas Name:", ["-"], key="select_dinas_desc_disabled", disabled=True)
+        else:
+            selected_dinas_desc = st.selectbox(
+                "Select Dinas Name:", unique_dinas_desc, key="select_dinas_desc"
+            )
+
+    # Dropdown 4: Sub Dinas appears conditionally
+    selected_sub_dinas_desc = "-" # Default
+    if ecosystem_level_choice == "Sub Dinas":
+        # Get sub dinas based on selected entity and dinas
+        sub_dinas_from_source = filtered_data[
+            (filtered_data['source_entity_name'] == selected_entity_name) &
+            (filtered_data['source_kode_dinas_desc'] == selected_dinas_desc)
+        ]['source_kode_sub_dinas_desc'].dropna().astype(str).tolist()
+
+        sub_dinas_from_dest = filtered_data[
+            (filtered_data['dest_entity_name'] == selected_entity_name) &
+            (filtered_data['dest_kode_dinas_desc'] == selected_dinas_desc)
+        ]['dest_kode_sub_dinas_desc'].dropna().astype(str).tolist()
+
+        unique_sub_dinas_desc = sorted(list(set(sub_dinas_from_source + sub_dinas_from_dest)))
+
+        if not unique_sub_dinas_desc:
+            st.info(f"No Sub Dinas available for '{selected_entity_name}' and '{selected_dinas_desc}'.")
+            st.selectbox("Select Sub Dinas Name:", ["-"], key="select_sub_dinas_desc_disabled", disabled=True)
+        else:
+            selected_sub_dinas_desc = st.selectbox(
+                "Select Sub Dinas Name:", unique_sub_dinas_desc, key="select_sub_dinas_desc"
+            )
+
+
+    # --- Global Column and Filter Mask Settings ---
+    
+    if ecosystem_level_choice == "Ecosystem":
+        src_col_net_global = 'source_entity_name'
+        dst_col_net_global = 'dest_entity_name'
+        src_col_sankey_global = 'source_entity_name'
+        dst_col_sankey_global = 'dest_entity_name'
+        display_name = selected_entity_name 
+        selected_node_value = selected_entity_name # Set selected_node_value for Ecosystem
+        filter_mask = (filtered_data['source_entity_name'] == selected_entity_name) | \
+                      (filtered_data['dest_entity_name'] == selected_entity_name)
+    elif ecosystem_level_choice == "Dinas":
+        src_col_net_global = 'source_kode_dinas_desc'
+        dst_col_net_global = 'dest_kode_dinas_desc'
+        src_col_sankey_global = 'source_kode_dinas_desc'
+        dst_col_sankey_global = 'dest_kode_dinas_desc'
+        display_name = selected_dinas_desc 
+        selected_node_value = selected_dinas_desc # Set selected_node_value for Dinas
+        
+        filter_mask = (
+            ((filtered_data['source_entity_name'] == selected_entity_name) & 
+             (filtered_data['source_kode_dinas_desc'] == selected_dinas_desc)) | 
+            ((filtered_data['dest_entity_name'] == selected_entity_name) & 
+             (filtered_data['dest_kode_dinas_desc'] == selected_dinas_desc))
+        )
+        # If no specific dinas is selected (i.e., it's "-"), revert to filtering only by entity name
+        if selected_dinas_desc == "-":
+            filter_mask = (filtered_data['source_entity_name'] == selected_entity_name) | \
+                          (filtered_data['dest_entity_name'] == selected_entity_name)
+            selected_node_value = selected_entity_name # If dinas is "-", then the "selected node" is the entity
+    else: # ecosystem_level_choice == "Sub Dinas"
+        src_col_net_global = 'source_kode_sub_dinas_desc'
+        dst_col_net_global = 'dest_kode_sub_dinas_desc'
+        src_col_sankey_global = 'source_kode_sub_dinas_desc'
+        dst_col_sankey_global = 'dest_kode_sub_dinas_desc'
+        display_name = selected_sub_dinas_desc
+        selected_node_value = selected_sub_dinas_desc
+
+        filter_mask = (
+            ((filtered_data['source_entity_name'] == selected_entity_name) &
+             (filtered_data['source_kode_dinas_desc'] == selected_dinas_desc) &
+             (filtered_data['source_kode_sub_dinas_desc'] == selected_sub_dinas_desc)) |
+            ((filtered_data['dest_entity_name'] == selected_entity_name) &
+             (filtered_data['dest_kode_dinas_desc'] == selected_dinas_desc) &
+             (filtered_data['dest_kode_sub_dinas_desc'] == selected_sub_dinas_desc))
+        )
+        # If no specific sub dinas is selected (i.e., it's "-"), revert to filtering by entity and dinas
+        if selected_sub_dinas_desc == "-":
+            filter_mask = (
+                ((filtered_data['source_entity_name'] == selected_entity_name) & 
+                 (filtered_data['source_kode_dinas_desc'] == selected_dinas_desc)) | 
+                ((filtered_data['dest_entity_name'] == selected_entity_name) & 
+                 (filtered_data['dest_kode_dinas_desc'] == selected_dinas_desc))
+            )
+            selected_node_value = selected_dinas_desc # If sub dinas is "-", then the "selected node" is the dinas
+
+    # Final DataFrame for visualization
+    filtered_network_data = filtered_data[filter_mask]
+
+    # Determine input_data and output_data based on updated global columns
+    if filtered_network_data.empty or selected_node_value == "-": 
+        input_data = pd.DataFrame(columns=filtered_data.columns)
+        output_data = pd.DataFrame(columns=filtered_data.columns)
+        # Reset specific info for ecosystem
+        name = "-"
+        cif_type = "-"
+        account_str = "-"
+        selected_entity = selected_entity_name # This is the entity name, not selected_entity
+        selected_kode_dinas = selected_dinas_desc if ecosystem_level_choice in ["Dinas", "Sub Dinas"] else "-"
+        selected_kode_sub_dinas = selected_sub_dinas_desc if ecosystem_level_choice == "Sub Dinas" else "-"
+        selected_kode_sub_sub_dinas = "-"
+    else:
+        input_data = filtered_network_data[filtered_network_data[dst_col_sankey_global] == selected_node_value]
+        output_data = filtered_network_data[filtered_network_data[src_col_sankey_global] == selected_node_value]
+        # For Ecosystem/Dinas, some CIF details might not be directly applicable
+        if node_type == "by Ecosystem":
+            name = "-" # Name is only for CIFs
+            cif_type = "-"
+            account_str = "-"
+            selected_entity = selected_entity_name
+            selected_kode_dinas = selected_dinas_desc if ecosystem_level_choice in ["Dinas", "Sub Dinas"] else "-"
+            selected_kode_sub_dinas = selected_sub_dinas_desc if ecosystem_level_choice == "Sub Dinas" else "-"
+            selected_kode_sub_sub_dinas = "-"
+
+
+# ------------------- Tabs for Visualization -------------------
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Network Graph", 
+    "Sankey: Input Transactions", 
+    "Sankey: Output Transactions", 
+    "Transaction Summary"
+])
+
+with tab1:
+    # Check if filtered_network_data is empty before creating visualization
+    if filtered_network_data.empty:
+        st.info("No connections found for the selected node in this date range.")
+    else:
+        # Pass dynamically selected columns to the create_network_visualization function
+        net, edge_data, node_color_map_for_legend = create_network_visualization( # Retrieve node_color_map_by_entity
+            filtered_network_data, 
+            node_type, 
+            src_col_net_global, 
+            dst_col_net_global, 
+            full_data=data, # Use 'data' (full dataset) for CIF info lookup
+            selected_entity_filter=selected_entity_name, # Pass the filter values
+            selected_dinas_filter=selected_dinas_desc,
+            selected_sub_dinas_filter=selected_sub_dinas_desc
+        )
+
+        # Save HTML file to a unique temporary file (per session)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".html", delete=False) as tmpfile:
+            net.save_graph(tmpfile.name)
+            html_content = open(tmpfile.name).read()
+            # --- Changes here: Legend font size and padding ---
+            legend_html = "<div style='position:absolute;top:10px;left:10px;z-index:1000;padding:5px;background:white;border:1px solid gray;font-size:10px;'>" 
+            
+            for entity, color in sorted(node_color_map_for_legend.items()):
+                legend_html += f"<div style='margin-bottom:2px'><span style='display:inline-block;width:10px;height:10px;background:{color};margin-right:4px;border-radius:2px'></span>{entity}</div>"
+            # ----------------------------------------------------------------------
+            
+            legend_html += "</div>"
+            html_content = html_content.replace("</body>", legend_html + "</body>")
+
+        # Delete file after content is read
+        os.remove(tmpfile.name)        
+        
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.components.v1.html(html_content, height=750)
+        with col2:
+            st.markdown(f"**Network Connections:** {len(edge_data)}")
+            st.markdown(f"**Total Frequency:** {filtered_network_data['amount'].count()}")
+            st.markdown(f"**Total Amount:** Rp.{filtered_network_data['amount'].sum():,.2f}")
+            with st.expander("📋 Show Detailed Data", expanded=False):
+                selected_cols = [
+                "source_cif", "source_account_no", "source_customer_name", "source_cif_type_name",
+                "source_entity_name", "source_kode_dinas", "source_kode_dinas_desc",
+                "source_kode_sub_dinas", "source_kode_sub_dinas_desc", "source_kode_sub_sub_dinas", "source_kode_sub_sub_dinas_desc",
+                "dest_cif", "dest_account_no", "dest_customer_name", "dest_cif_type_name",
+                "dest_entity_name", "dest_kode_dinas", "dest_kode_dinas_desc",
+                "dest_kode_sub_dinas", "dest_kode_sub_dinas_desc", "dest_kode_sub_sub_dinas", "dest_kode_sub_sub_dinas_desc",
+                "transaction_name", "jenis_transaksi", "amount", "dt_id", "group_channel"
+                ]
+
+                st.dataframe(
+                    filtered_network_data[selected_cols].sort_values('dt_id', ascending=False).reset_index(drop=True),
+                    use_container_width=True
+                )
+
+for title, df_raw, key in zip(["Input Transactions", "Output Transactions"], [input_data, output_data], ['input', 'output']):
+    with (tab2 if key == 'input' else tab3):
+        st.subheader(title)
+        st.markdown("""<style>text { fill: white !important; font-weight: bold; text-shadow: 0 0 3px black; }</style>""", unsafe_allow_html=True)
+
+        # Get source and destination columns from global variables
+        src_col, dst_col = src_col_sankey_global, dst_col_sankey_global
+
+        # Check if the columns used for sankey are in df_raw
+        if src_col not in df_raw.columns or dst_col not in df_raw.columns:
+            st.info(f"Columns '{src_col}' or '{dst_col}' not found in {title} transaction data. Cannot display Sankey Diagram.")
+            continue # Continue to the next iteration
+
+        # Clean data: remove nulls and self-loops
+        df_clean = df_raw.dropna(subset=['amount', src_col, dst_col])
+        df_clean = df_clean[df_clean[src_col] != df_clean[dst_col]]
+
+        unique_src = df_clean[src_col].nunique()
+        unique_dst = df_clean[dst_col].nunique()
+
+        if df_clean.empty or min(unique_src, unique_dst) < 1:
+            st.info(
+                f"""
+                ⚠️ Unable to display Sankey Diagram for **{title}**.
+
+                This may happen because the selected node has:
+                - No incoming or outgoing transactions, **or**
+                - Only self-transactions or missing key fields.
+
+                Please try selecting another node or adjust your filters.
+                """
+            )
+        else:
+            # Pass the appropriate columns to the create_sankey_visualization function
+            fig = create_sankey_visualization(df_clean, src_col, dst_col)
+            st.plotly_chart(fig, use_container_width=True, key=f'{key}_sankey')
+
+with tab4:
+    # --- Function to format numbers ---
+    def format_amount(amount):
+        if pd.isna(amount):
+            return "-"
+        if amount >= 1_000_000_000_000:
+            return f"Rp.{amount / 1_000_000_000_000:.1f} T"
+        elif amount >= 1_000_000_000:
+            return f"Rp.{amount / 1_000_000_000:.1f} M"
+        elif amount >= 1_000_000:
+            return f"Rp.{amount / 1_000_000:.1f} JT" # JT for Juta (Million)
+        else:
+            return f"Rp.{amount:,.0f}"
+
+    # Check if filtered_network_data is empty
+    if filtered_network_data.empty:
+        st.info("No transaction data matching the selected filters to display in the summary.")
+    else:
+        # Time Series Summary
+        time_series = filtered_network_data.copy()
+        time_series["date"] = time_series["dt_id"].dt.date
+        summary_daily = time_series.groupby("date").agg(
+            total_amount=("amount", "sum"),
+            transaction_count=("amount", "count")
+        ).reset_index()
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Total Amount per Day**")
+            # Using Matplotlib/Seaborn with dots
+            fig, ax = plt.subplots(figsize=(10, 6))
+            sns.lineplot(x="date", y="total_amount", data=summary_daily, ax=ax, marker='o') # Added marker='o'
+            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: format_amount(x)))
+            ax.tick_params(axis='x', rotation=45)
+            plt.xlabel("Date")
+            plt.ylabel("Total Amount")
+            st.pyplot(fig) # Display the matplotlib figure
+            plt.close(fig) # Close the figure to prevent display issues
+
+        with col2:
+            st.markdown("**Transaction Count per Day**")
+            fig, ax = plt.subplots(figsize=(10, 6))
+            sns.lineplot(x="date", y="transaction_count", data=summary_daily, ax=ax, marker='o') # Added marker='o'
+            ax.tick_params(axis='x', rotation=45)
+            plt.xlabel("Date")
+            plt.ylabel("Transaction Count")
+            st.pyplot(fig)
+            plt.close(fig) # Close the figure to prevent display issues
+
+        st.markdown("---")
