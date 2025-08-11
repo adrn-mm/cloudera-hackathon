@@ -11,86 +11,182 @@ import tempfile
 import matplotlib.pyplot as plt
 import seaborn as sns
 import openai
+import json
+import networkx as nx
 
 st.set_page_config(page_title="Transactional Network Analysis", page_icon="🕸️", layout="wide")
 st.title("🕸️ Transactional Network Analysis")
 
 # ------------------- AI Prompt -------------------
-# FUNGSI 1: Membuat ringkasan teks untuk dikirim ke AI
+# GANTI FUNGSI LAMA ANDA DENGAN VERSI BARU INI
+
+# Jangan lupa import networkx di bagian atas file Anda
+import networkx as nx
+
+# GANTI FUNGSI LAMA ANDA DENGAN VERSI BARU INI
+def find_most_influential_node(df, nodes, src_col, dst_col, method='pagerank'):
+    """
+    Menemukan node paling berpengaruh menggunakan berbagai metode centrality.
+    Metode yang tersedia: 'amount', 'betweenness', 'pagerank'.
+    """
+    if not nodes or df.empty:
+        return None
+
+    # Filter hanya untuk transaksi yang relevan dengan node yang terlibat
+    # Ini penting agar centrality dihitung dalam konteks pola yang ditemukan AI
+    relevant_df = df[df[src_col].isin(nodes) | df[dst_col].isin(nodes)]
+    if relevant_df.empty:
+        return nodes[0]
+
+    # --- Metode 1: Berdasarkan Total Amount (Cara Lama) ---
+    if method == 'amount':
+        source_amounts = relevant_df.groupby(src_col)['amount'].sum()
+        dest_amounts = relevant_df.groupby(dst_col)['amount'].sum()
+        total_amounts = source_amounts.add(dest_amounts, fill_value=0)
+        relevant_amounts = total_amounts.reindex(nodes).fillna(0)
+        if relevant_amounts.sum() == 0: return nodes[0]
+        return relevant_amounts.idxmax()
+
+    # --- Metode Canggih Menggunakan NetworkX ---
+    # Buat graph dari DataFrame
+    G = nx.from_pandas_edgelist(
+        relevant_df,
+        source=src_col,
+        target=dst_col,
+        edge_attr='amount',
+        create_using=nx.DiGraph() # Gunakan Directed Graph karena transaksi punya arah
+    )
+
+    # Pastikan semua 'involved_nodes' ada di graph, tambahkan jika belum ada
+    for node in nodes:
+        if not G.has_node(node):
+            G.add_node(node)
+
+    centrality_scores = {}
+
+    # --- Metode 2: Betweenness Centrality (Si Pialang) ---
+    if method == 'betweenness':
+        # Bobot diinversi agar transaksi besar dianggap 'jarak pendek'
+        # Namun untuk simplisitas, kita hitung tanpa bobot agar fokus pada struktur
+        centrality_scores = nx.betweenness_centrality(G, normalized=True)
+
+    # --- Metode 3: PageRank Centrality (Si Paling Populer) ---
+    elif method == 'pagerank':
+        centrality_scores = nx.pagerank(G, alpha=0.85, weight='amount')
+
+    if not centrality_scores:
+        return nodes[0] # Fallback
+
+    # Filter skor hanya untuk node yang ada di `involved_nodes`
+    relevant_scores = {node: score for node, score in centrality_scores.items() if node in nodes}
+    
+    if not relevant_scores:
+        return nodes[0] # Fallback
+
+    # Kembalikan node dengan skor centrality tertinggi
+    return max(relevant_scores, key=relevant_scores.get)
+
 def generate_network_summary_for_ai(df_filtered, edge_data, display_name, node_type, src_col, dst_col):
-    """Menyusun data jaringan menjadi ringkasan teks yang komprehensif untuk AI."""
+    """Menyusun data jaringan dan meminta output JSON yang sangat terstruktur, termasuk node pusat."""
     
     total_transactions = len(df_filtered)
     total_amount = df_filtered['amount'].sum()
-    unique_sources = df_filtered[src_col].nunique()
-    unique_dests = df_filtered[dst_col].nunique()
+    
+    if edge_data.empty:
+        flows_amount_str = "Tidak ada aliran dana yang signifikan."
+        flows_freq_str = "Tidak ada aliran dana yang signifikan."
+    else:
+        top_5_flows_amount = edge_data.sort_values('total_amount', ascending=False).head(5)
+        flows_amount_str = "\n".join([f"- Dari '{row[src_col]}' ke '{row[dst_col]}': Rp {row['total_amount']:,.0f}" for _, row in top_5_flows_amount.iterrows()])
+        top_5_flows_freq = edge_data.sort_values('frequency', ascending=False).head(5)
+        flows_freq_str = "\n".join([f"- Dari '{row[src_col]}' ke '{row[dst_col]}': {int(row['frequency'])} transaksi" for _, row in top_5_flows_freq.iterrows()])
 
-    # Ambil top 5 aliran dana berdasarkan jumlah
-    top_5_flows_amount = edge_data.sort_values('total_amount', ascending=False).head(5)
-    flows_amount_str = "\n".join([f"- Dari {row[src_col]} ke {row[dst_col]}: Rp {row['total_amount']:,.0f} ({int(row['frequency'])} transaksi)" for index, row in top_5_flows_amount.iterrows()])
-
-    # Ambil top 5 aliran dana berdasarkan frekuensi
-    top_5_flows_freq = edge_data.sort_values('frequency', ascending=False).head(5)
-    flows_freq_str = "\n".join([f"- Dari {row[src_col]} ke {row[dst_col]}: {int(row['frequency'])} transaksi (Total Rp {row['total_amount']:,.0f})" for index, row in top_5_flows_freq.iterrows()])
-
-    # Rangkai semua menjadi satu prompt
+    # PROMPT BARU DENGAN INSTRUKSI LEBIH TEGAS DAN PERMINTAAN 'central_node'
     prompt = f"""
     Analisis Konteks:
     - Perspektif Analisis: {node_type}
     - Fokus Utama: Node '{display_name}'
     - Periode Waktu: Dari {df_filtered['dt_id'].min().date()} hingga {df_filtered['dt_id'].max().date()}
-
-    Statistik Jaringan Keseluruhan:
-    - Total Transaksi: {total_transactions}
     - Total Nilai Transaksi: Rp {total_amount:,.0f}
-    - Jumlah Sumber Unik: {unique_sources}
-    - Jumlah Tujuan Unik: {unique_dests}
-
-    Aliran Dana Terbesar (Berdasarkan Nilai):
+    - Aliran Dana Terbesar:
     {flows_amount_str}
-
-    Aliran Dana Paling Sering (Berdasarkan Frekuensi):
+    - Aliran Dana Paling Sering:
     {flows_freq_str}
 
-    Tugas Anda:
-    Berdasarkan data di atas, bertindaklah sebagai seorang analis keuangan forensik. Identifikasi 2-3 pola transaksi yang paling menarik, tidak biasa, atau berpotensi berisiko. Jelaskan mengapa pola-pola ini menarik dan berikan rekomendasi konkret tentang apa yang harus diselidiki lebih lanjut. Gunakan format poin-poin (bullet points) untuk setiap pola yang diidentifikasi.
+    TUGAS ANDA:
+    Bertindaklah sebagai analis keuangan forensik. Identifikasi 2 hingga 4 pola transaksi paling menarik.
+
+    INSTRUKSI FORMAT OUTPUT (WAJIB DIIKUTI):
+    Anda HARUS mengembalikan respons HANYA dalam format sebuah JSON OBJECT tunggal. JSON object ini WAJIB memiliki sebuah key tunggal bernama "patterns", di mana value-nya adalah sebuah LIST dari beberapa object.
+    Setiap object di dalam list "patterns" harus memiliki kunci-kunci berikut:
+    1. "pattern_title": Judul singkat yang menarik.
+    2. "pattern_type": Klasifikasi pola. Pilih dari: "ONE_TO_MANY", "MANY_TO_ONE", "HIGH_VOLUME_PAIR", "CYCLICAL_FLOW", "UNUSUAL_OUTLIER".
+    3. "involved_nodes": Sebuah list berisi SEMUA nama node yang relevan dengan pola ini.
+    4. "central_node": Nama node yang menjadi PUSAT dari pola. Untuk "ONE_TO_MANY", ini adalah sumbernya. Untuk "MANY_TO_ONE", ini adalah tujuannya. Untuk "HIGH_VOLUME_PAIR", bisa diisi dengan salah satu dari dua node. Untuk pola lain tanpa pusat yang jelas, isi dengan string kosong (""). INI SANGAT PENTING.
+    5. "explanation": Penjelasan detail mengapa pola ini menarik dan rekomendasi investigasi.
+
+    CONTOH OUTPUT JSON YANG BENAR:
+    {{
+      "patterns": [
+        {{
+          "pattern_title": "Distribusi Gaji dari Dinas Pendidikan",
+          "pattern_type": "ONE_TO_MANY",
+          "involved_nodes": ["DINAS PENDIDIKAN", "Karyawan A", "Karyawan B"],
+          "central_node": "DINAS PENDIDIKAN",
+          "explanation": "Terdeteksi satu sumber utama 'DINAS PENDIDIKAN' yang mengirimkan dana ke banyak tujuan. Ini khas dengan pola pembayaran gaji."
+        }}
+      ]
+    }}
+
+    PENTING: Pastikan output Anda adalah JSON object tunggal yang valid, dimulai dengan `{{` dan diakhiri dengan `}}`.
     """
     return prompt
 
-# FUNGSI 2: Memanggil API OpenAI dan mendapatkan analisis
-@st.cache_data(show_spinner=False) # Cache untuk menghindari panggilan API berulang
-def get_ai_analysis(summary_prompt):
-    """Mengirim prompt ke OpenAI dan mengembalikan responsnya."""
+@st.cache_data(show_spinner=False)
+def get_ai_analysis_json(summary_prompt):
+    """Mengirim prompt ke OpenAI, meminta JSON, dan mengembalikannya sebagai objek Python."""
     try:
-        # Ambil API key dari st.secrets
         openai.api_key = st.secrets["OPENAI_API_KEY"]
-        
         client = openai.OpenAI()
-
+        
         response = client.chat.completions.create(
-            model="gpt-4o",  # Gunakan model terbaru atau gpt-3.5-turbo untuk lebih hemat
+            model="gpt-4o",
             messages=[
-                {
-                    "role": "system",
-                    "content": "Anda adalah seorang analis keuangan dan investigator ahli dalam mendeteksi anomali dari data jaringan transaksi. Anda memberikan wawasan yang tajam, jelas, dan dapat ditindaklanjuti."
-                },
-                {
-                    "role": "user",
-                    "content": summary_prompt
-                }
+                {"role": "system", "content": "Anda adalah seorang analis keuangan ahli yang mengembalikan output HANYA dalam format JSON yang valid sesuai instruksi."},
+                {"role": "user", "content": summary_prompt}
             ],
-            temperature=0.5, # Membuat jawaban lebih fokus dan tidak terlalu acak
-            max_tokens=500,
+            response_format={"type": "json_object"},
+            temperature=0.3,
+            max_tokens=1000,
         )
-        return response.choices[0].message.content
+        
+        response_content = response.choices[0].message.content
+        parsed_json = json.loads(response_content)
+        
+        # --- LOGIKA PARSING BARU YANG LEBIH CERDAS ---
+        # Jika respons sudah berupa list, langsung kembalikan.
+        if isinstance(parsed_json, list):
+            return parsed_json
+            
+        # Jika berupa dictionary, cari value yang merupakan list (ini menangani kasus {"patterns": [...]})
+        if isinstance(parsed_json, dict):
+            for key, value in parsed_json.items():
+                if isinstance(value, list):
+                    return value # Ditemukan list-nya, kembalikan
+        
+        # Jika tidak ditemukan format yang benar, kembalikan sebagai error format
+        return {"error": "Format JSON dari AI tidak sesuai (bukan list atau dict berisi list).", "raw_response": response_content}
+
+    except json.JSONDecodeError as e:
+        return {"error": f"Gagal mem-parsing JSON dari AI: {e}", "raw_response": response_content}
     except Exception as e:
-        return f"Terjadi kesalahan saat menghubungi OpenAI API: {e}"
+        return {"error": f"Terjadi kesalahan saat menghubungi OpenAI API: {e}"}
 
 # ------------------- UI & Sidebar -------------------
 @st.cache_data(show_spinner=False)
 def get_available_partitions():
     # Adjust this path to your file location
-    local_path = r"C:\Users\adrian.muhammad\Desktop\SNA\list_partitions\available_partitions.csv"
+    local_path = r"C:\Users\LENOVO\OneDrive\Desktop\cloudera-hackathon\list_partitions\available_partitions.csv"
     # Check if the file exists
     if not os.path.exists(local_path):
         st.warning(f"File partition list not found at {local_path}")
@@ -133,7 +229,7 @@ selected_ym = int(f"{selected_year}{selected_month:02}")
 @st.cache_data(show_spinner=False)
 def load_data_from_month(ym: int):
     # Adjust this path to your file location
-    local_zip_file = rf"C:\Users\adrian.muhammad\Desktop\SNA\data_cache\month={ym}.zip"
+    local_zip_file = rf"C:\Users\LENOVO\OneDrive\Desktop\cloudera-hackathon\data_cache\month={ym}.zip"
 
     if not os.path.exists(local_zip_file):
         st.error(f"❌ Zip file not found: {local_zip_file}")
@@ -933,57 +1029,121 @@ with tab4:
             plt.close(fig) # Close the figure to prevent display issues
 
         st.markdown("---")
-        
+
 with tab5:
-    st.subheader("🤖 AI-Powered Pattern Analysis")
-    st.markdown("""
-    Gunakan kekuatan Generative AI untuk menganalisis jaringan transaksi Anda. AI akan memberikan narasi tentang pola-pola yang paling signifikan, anomali potensial, dan rekomendasi investigasi berdasarkan data yang sedang ditampilkan.
-    """)
+    container = st.container(border=True)
 
-    # Pastikan edge_data sudah dibuat di tab1
-    # Jika belum, kita perlu membuatnya di sini juga.
-    try:
-        # Cek apakah edge_data sudah ada dari tab1
-        _ = edge_data
-    except NameError:
-        # Jika belum, buat ringkasannya
-        if not filtered_network_data.empty:
-            edge_data = (
-                filtered_network_data
-                .groupby([src_col_net_global, dst_col_net_global])
-                .agg(
-                    total_amount=('amount', 'sum'),
-                    frequency=('amount', 'count'),
-                )
-                .reset_index()
+    # Inisialisasi edge_data jika belum ada
+    if 'edge_data' not in locals() and not filtered_network_data.empty:
+        edge_data = filtered_network_data.groupby([src_col_net_global, dst_col_net_global]).agg(
+            total_amount=('amount', 'sum'), frequency=('amount', 'count')
+        ).reset_index()
+    elif filtered_network_data.empty:
+        edge_data = pd.DataFrame()
+
+    if container.button("🔍 Analisis Jaringan dengan AI", type="primary", use_container_width=True):
+        if 'ai_patterns' in st.session_state:
+            del st.session_state['ai_patterns']
+        with st.spinner("🧠 AI sedang berpikir keras... Menganalisis jutaan kemungkinan..."):
+            summary = generate_network_summary_for_ai(
+                filtered_network_data, edge_data, display_name, node_type, 
+                src_col_net_global, dst_col_net_global
             )
+            ai_patterns = get_ai_analysis_json(summary)
+            if isinstance(ai_patterns, list) and all(isinstance(item, dict) for item in ai_patterns):
+                st.session_state['ai_patterns'] = ai_patterns
+                st.session_state['selected_pattern_index'] = 0
+                st.rerun()
+            else:
+                st.session_state['ai_patterns'] = None
+                error_detail = "Format respons tidak terduga."
+                raw_response = None
+                if isinstance(ai_patterns, dict):
+                    error_detail = ai_patterns.get('error', error_detail)
+                    raw_response = ai_patterns.get('raw_response')
+                st.error(f"Gagal mendapatkan analisis dari AI. Detail: {error_detail}")
+                if raw_response:
+                    st.text_area("Respons Mentah AI", raw_response, height=200)
+                else:
+                    st.json(ai_patterns)
+
+    # Tampilkan hasil jika sudah ada di session state
+    if 'ai_patterns' in st.session_state and st.session_state['ai_patterns'] is not None:
+        patterns = st.session_state['ai_patterns']
+        
+        if not patterns:
+            st.success("✅ Analisis Selesai. AI tidak menemukan pola yang cukup signifikan untuk dilaporkan.")
         else:
-            edge_data = pd.DataFrame()
-
-
-    if filtered_network_data.empty:
-        st.info("Tidak ada data transaksi yang tersedia untuk dianalisis. Silakan sesuaikan filter Anda.")
-    else:
-        # Tombol untuk memicu analisis AI (agar tidak berjalan otomatis & menghabiskan biaya)
-        if st.button("Minta Analisis dari AI", type="primary"):
-            with st.spinner("AI sedang menganalisis data... Ini mungkin memakan waktu beberapa detik."):
-                
-                # 1. Buat prompt ringkasan
-                # PENTING: Pastikan tidak ada data PII (Nama, CIF, No. Rek) yang dikirim.
-                # Kolom seperti 'source_entity_name' atau 'source_kode_dinas_desc' aman.
-                summary = generate_network_summary_for_ai(
-                    filtered_network_data, 
-                    edge_data, 
-                    display_name, 
-                    node_type, 
-                    src_col_net_global, 
-                    dst_col_net_global
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                pattern_titles = [p.get('pattern_title', f'Pola Tanpa Nama {i+1}') for i, p in enumerate(patterns)]
+                selected_index = st.selectbox(
+                    "Pola Menarik yang Ditemukan AI:", 
+                    options=range(len(pattern_titles)),
+                    format_func=lambda i: f"💡 {pattern_titles[i]}", 
+                    key='selected_pattern_index'
                 )
-                
-                # 2. Dapatkan analisis dari OpenAI
-                ai_result = get_ai_analysis(summary)
-                
-                # 3. Tampilkan hasil
-                st.markdown("---")
-                st.subheader("Hasil Analisis AI")
-                st.markdown(ai_result)
+            with col2:
+                influence_method = st.selectbox(
+                    "Metode Penentuan Node Berpengaruh:",
+                    options=['pagerank', 'betweenness', 'amount'],
+                    format_func=lambda x: {'pagerank': 'PageRank (Pengaruh Relasional)', 'betweenness': 'Betweenness (Peran Pialang)', 'amount': 'Total Nominal (Sederhana)'}[x],
+                    help="Pilih cara untuk menentukan node pusat dari sebuah pola. PageRank menemukan 'tujuan populer', Betweenness menemukan 'jembatan/perantara'."
+                )
+
+            selected_pattern = patterns[selected_index]
+            involved_nodes = selected_pattern.get('involved_nodes', [])
+
+            st.markdown(f"#### 📖 Penjelasan AI: *{selected_pattern.get('pattern_title', '')}*")
+            st.info(f"**Analisis:** {selected_pattern.get('explanation', 'Tidak ada penjelasan.')}")
+
+            if not involved_nodes:
+                st.warning("Visualisasi tidak dapat dibuat karena AI tidak menyertakan daftar node yang terlibat.")
+            else:
+                context_df = filtered_network_data[
+                    (filtered_network_data[src_col_net_global].isin(involved_nodes)) |
+                    (filtered_network_data[dst_col_net_global].isin(involved_nodes))
+                ]
+                if context_df.empty:
+                    st.warning("Tidak ditemukan transaksi yang sesuai dengan detail pola dari AI.")
+                else:
+                    pivot_node = find_most_influential_node(context_df, involved_nodes, src_col_net_global, dst_col_net_global, method=influence_method)
+                    
+                    st.info(f"Visualisasi berikut difokuskan pada node yang dianggap paling berpengaruh berdasarkan metode **{influence_method.capitalize()}**: **{pivot_node}**")
+
+                    st.markdown("**Network Graph Kontekstual**")
+                    net_pattern, _, _ = create_network_visualization(
+                        context_df, node_type, src_col_net_global, dst_col_net_global,
+                        full_data=data, selected_entity_filter=selected_entity_name,
+                        selected_dinas_filter=selected_dinas_desc, selected_sub_dinas_filter=selected_sub_dinas_desc
+                    )
+                    
+                    try:
+                        with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding='utf-8') as tmpfile:
+                            filepath = tmpfile.name
+                            net_pattern.save_graph(filepath)
+                        with open(filepath, 'r', encoding='utf-8') as f:
+                            html_content = f.read()
+                        os.remove(filepath)
+                        st.components.v1.html(html_content, height=650, scrolling=True)
+                    except Exception as e:
+                        st.error(f"Gagal membuat network graph: {e}")
+                        
+                    if not pivot_node:
+                        st.warning("Tidak dapat menentukan node pusat untuk membuat Sankey Diagram.")
+                    else:
+                        st.markdown(f"**Aliran Dana MASUK ke `{pivot_node}`**")
+                        input_df = context_df[context_df[dst_col_net_global] == pivot_node]
+                        if not input_df.empty:
+                            fig_sankey_input = create_sankey_visualization(input_df, src_col_net_global, dst_col_net_global)
+                            st.plotly_chart(fig_sankey_input, use_container_width=True)
+                        else:
+                            st.info(f"Tidak ada aliran dana masuk yang signifikan ke `{pivot_node}` dalam konteks ini.")
+                    
+                        st.markdown(f"**Aliran Dana KELUAR dari `{pivot_node}`**")
+                        output_df = context_df[context_df[src_col_net_global] == pivot_node]
+                        if not output_df.empty:
+                            fig_sankey_output = create_sankey_visualization(output_df, src_col_net_global, dst_col_net_global)
+                            st.plotly_chart(fig_sankey_output, use_container_width=True)
+                        else:
+                            st.info(f"Tidak ada aliran dana keluar yang signifikan dari `{pivot_node}` dalam konteks ini.")
