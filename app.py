@@ -10,9 +10,81 @@ import os
 import tempfile
 import matplotlib.pyplot as plt
 import seaborn as sns
+import openai
 
 st.set_page_config(page_title="Transactional Network Analysis", page_icon="🕸️", layout="wide")
 st.title("🕸️ Transactional Network Analysis")
+
+# ------------------- AI Prompt -------------------
+# FUNGSI 1: Membuat ringkasan teks untuk dikirim ke AI
+def generate_network_summary_for_ai(df_filtered, edge_data, display_name, node_type, src_col, dst_col):
+    """Menyusun data jaringan menjadi ringkasan teks yang komprehensif untuk AI."""
+    
+    total_transactions = len(df_filtered)
+    total_amount = df_filtered['amount'].sum()
+    unique_sources = df_filtered[src_col].nunique()
+    unique_dests = df_filtered[dst_col].nunique()
+
+    # Ambil top 5 aliran dana berdasarkan jumlah
+    top_5_flows_amount = edge_data.sort_values('total_amount', ascending=False).head(5)
+    flows_amount_str = "\n".join([f"- Dari {row[src_col]} ke {row[dst_col]}: Rp {row['total_amount']:,.0f} ({int(row['frequency'])} transaksi)" for index, row in top_5_flows_amount.iterrows()])
+
+    # Ambil top 5 aliran dana berdasarkan frekuensi
+    top_5_flows_freq = edge_data.sort_values('frequency', ascending=False).head(5)
+    flows_freq_str = "\n".join([f"- Dari {row[src_col]} ke {row[dst_col]}: {int(row['frequency'])} transaksi (Total Rp {row['total_amount']:,.0f})" for index, row in top_5_flows_freq.iterrows()])
+
+    # Rangkai semua menjadi satu prompt
+    prompt = f"""
+    Analisis Konteks:
+    - Perspektif Analisis: {node_type}
+    - Fokus Utama: Node '{display_name}'
+    - Periode Waktu: Dari {df_filtered['dt_id'].min().date()} hingga {df_filtered['dt_id'].max().date()}
+
+    Statistik Jaringan Keseluruhan:
+    - Total Transaksi: {total_transactions}
+    - Total Nilai Transaksi: Rp {total_amount:,.0f}
+    - Jumlah Sumber Unik: {unique_sources}
+    - Jumlah Tujuan Unik: {unique_dests}
+
+    Aliran Dana Terbesar (Berdasarkan Nilai):
+    {flows_amount_str}
+
+    Aliran Dana Paling Sering (Berdasarkan Frekuensi):
+    {flows_freq_str}
+
+    Tugas Anda:
+    Berdasarkan data di atas, bertindaklah sebagai seorang analis keuangan forensik. Identifikasi 2-3 pola transaksi yang paling menarik, tidak biasa, atau berpotensi berisiko. Jelaskan mengapa pola-pola ini menarik dan berikan rekomendasi konkret tentang apa yang harus diselidiki lebih lanjut. Gunakan format poin-poin (bullet points) untuk setiap pola yang diidentifikasi.
+    """
+    return prompt
+
+# FUNGSI 2: Memanggil API OpenAI dan mendapatkan analisis
+@st.cache_data(show_spinner=False) # Cache untuk menghindari panggilan API berulang
+def get_ai_analysis(summary_prompt):
+    """Mengirim prompt ke OpenAI dan mengembalikan responsnya."""
+    try:
+        # Ambil API key dari st.secrets
+        openai.api_key = st.secrets["OPENAI_API_KEY"]
+        
+        client = openai.OpenAI()
+
+        response = client.chat.completions.create(
+            model="gpt-4o",  # Gunakan model terbaru atau gpt-3.5-turbo untuk lebih hemat
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Anda adalah seorang analis keuangan dan investigator ahli dalam mendeteksi anomali dari data jaringan transaksi. Anda memberikan wawasan yang tajam, jelas, dan dapat ditindaklanjuti."
+                },
+                {
+                    "role": "user",
+                    "content": summary_prompt
+                }
+            ],
+            temperature=0.5, # Membuat jawaban lebih fokus dan tidak terlalu acak
+            max_tokens=500,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Terjadi kesalahan saat menghubungi OpenAI API: {e}"
 
 # ------------------- UI & Sidebar -------------------
 @st.cache_data(show_spinner=False)
@@ -709,11 +781,12 @@ else: # node_type == "by Ecosystem"
 
 
 # ------------------- Tabs for Visualization -------------------
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "Network Graph", 
     "Sankey: Input Transactions", 
     "Sankey: Output Transactions", 
-    "Transaction Summary"
+    "Transaction Summary",
+    "AI Pattern Analysis"
 ])
 
 with tab1:
@@ -860,3 +933,57 @@ with tab4:
             plt.close(fig) # Close the figure to prevent display issues
 
         st.markdown("---")
+        
+with tab5:
+    st.subheader("🤖 AI-Powered Pattern Analysis")
+    st.markdown("""
+    Gunakan kekuatan Generative AI untuk menganalisis jaringan transaksi Anda. AI akan memberikan narasi tentang pola-pola yang paling signifikan, anomali potensial, dan rekomendasi investigasi berdasarkan data yang sedang ditampilkan.
+    """)
+
+    # Pastikan edge_data sudah dibuat di tab1
+    # Jika belum, kita perlu membuatnya di sini juga.
+    try:
+        # Cek apakah edge_data sudah ada dari tab1
+        _ = edge_data
+    except NameError:
+        # Jika belum, buat ringkasannya
+        if not filtered_network_data.empty:
+            edge_data = (
+                filtered_network_data
+                .groupby([src_col_net_global, dst_col_net_global])
+                .agg(
+                    total_amount=('amount', 'sum'),
+                    frequency=('amount', 'count'),
+                )
+                .reset_index()
+            )
+        else:
+            edge_data = pd.DataFrame()
+
+
+    if filtered_network_data.empty:
+        st.info("Tidak ada data transaksi yang tersedia untuk dianalisis. Silakan sesuaikan filter Anda.")
+    else:
+        # Tombol untuk memicu analisis AI (agar tidak berjalan otomatis & menghabiskan biaya)
+        if st.button("Minta Analisis dari AI", type="primary"):
+            with st.spinner("AI sedang menganalisis data... Ini mungkin memakan waktu beberapa detik."):
+                
+                # 1. Buat prompt ringkasan
+                # PENTING: Pastikan tidak ada data PII (Nama, CIF, No. Rek) yang dikirim.
+                # Kolom seperti 'source_entity_name' atau 'source_kode_dinas_desc' aman.
+                summary = generate_network_summary_for_ai(
+                    filtered_network_data, 
+                    edge_data, 
+                    display_name, 
+                    node_type, 
+                    src_col_net_global, 
+                    dst_col_net_global
+                )
+                
+                # 2. Dapatkan analisis dari OpenAI
+                ai_result = get_ai_analysis(summary)
+                
+                # 3. Tampilkan hasil
+                st.markdown("---")
+                st.subheader("Hasil Analisis AI")
+                st.markdown(ai_result)
